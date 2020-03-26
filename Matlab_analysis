@@ -1,0 +1,758 @@
+close all
+clear; clc
+
+
+% load original testing data and met properties
+dataPrepPath = '/raid/zzhou13/brainMets/datasets/prepAll/';
+load([dataPrepPath, 'detectPrep25D/mskTst.mat'])
+load([dataPrepPath, 'patientDataTest.mat'])
+load([dataPrepPath, 'testPt_sliceIdx.mat'])
+load([dataPrepPath, 'testPt_metProps.mat'])
+
+
+% load prediction mask
+mskPrd = h5read('mskPrdRe_JS_1slc_d50.h5', '/mskPrdRe');
+mskPrdPm = permute(mskPrd, [3,2,1]);
+mskPrdTh0 = uint8(mskPrdPm >= 0.95); % change the level set here
+
+
+%%% interpolation by convolution
+mskPrdPm2 = permute(mskPrdPm, [1,3,2]);
+mskPrdCopy = single(zeros(size(mskPrdPm2)));
+knl1 = [0.5, 1, 0.5];
+for i = 1:256
+    mskSlc = mskPrdPm2(:,:,i);
+    mskSlc = conv2(mskSlc, knl1, 'same');
+    mskPrdCopy(:,:,i) = mskSlc;
+end
+mskPrdCopy = permute(mskPrdCopy, [1,3,2]);
+mskPrdCopy = uint8(mskPrdCopy >= 0.95);
+
+
+%%% interpolation by slices
+mskPrdCopy = mskPrdTh0;
+se = strel('square',2);
+for i = 1:33328
+    mskSlc0 = mskPrdTh0(:,:,i);
+    if max(mskSlc0(:)) > 0
+        mskSlcM1 = mskPrdTh0(:,:,i-1);
+        mskSlcP1 = mskPrdTh0(:,:,i+1);
+        mskSlcP2 = mskPrdTh0(:,:,i+2);
+
+        cc0 = bwconncomp(mskSlc0);
+        stat0 = regionprops(cc0);
+        for j = 1:cc0.NumObjects
+            patchM1 = mskSlcM1(cc0.PixelIdxList{j});
+            patchP1 = mskSlcP1(cc0.PixelIdxList{j});
+            patchP2 = mskSlcP2(cc0.PixelIdxList{j});
+
+            wr1 = floor(stat0(j).BoundingBox(2));
+            wr2 = ceil(stat0(j).BoundingBox(2) + stat0(j).BoundingBox(4));
+            wc1 = floor(stat0(j).BoundingBox(1));              
+            wc2 = ceil(stat0(j).BoundingBox(1) + stat0(j).BoundingBox(3));
+            wcropS0 = mskSlc0(wr1:wr2, wc1:wc2);
+            wcrope0a = imerode(wcropS0, se);
+            wcrope0b = imerode(wcrope0a, se);
+            wcropS2 = mskSlcP2(wr1:wr2, wc1:wc2);
+                 
+            if max(patchM1) == 0 
+                mskSlcM1(wr1:wr2, wc1:wc2) = wcrope0a;
+            end
+            
+            if max(patchP1) == 0 && max(patchP2) ~= 0
+                wS0 = single(wcropS0);
+                wS2 = single(wcropS2);
+                wAve = uint8((wS0+wS2)/2 >= 0.55);
+                mskSlcP1(wr1:wr2, wc1:wc2) = wAve;
+            end
+            
+            if max(patchP1) == 0 && max(patchP2) == 0
+                mskSlcP1(wr1:wr2, wc1:wc2) = wcrope0a;
+                mskSlcP2(wr1:wr2, wc1:wc2) = wcrope0b;
+            end
+        end
+        mskPrdCopy(:,:,i-1) = mskSlcM1;
+        mskPrdCopy(:,:,i+1) = mskSlcP1;
+        mskPrdCopy(:,:,i+2) = mskSlcP2;
+    end
+end
+
+
+%%% interpolation by met volume
+mskPrdCopy = mskPrdTh0;
+ccVol = bwconncomp(mskPrdTh0);
+numVol = ccVol.NumObjects;
+statVol = regionprops(ccVol);
+
+volZse = zeros(numVol,2);
+xyBox = zeros(numVol,4);
+
+for i = 1:numVol
+    volZse(i,1) = ceil(statVol(i).BoundingBox(3));
+    volZse(i,2) = volZse(i,1) + statVol(i).BoundingBox(6) - 1;
+    xyBox(i,1) = ceil(statVol(i).BoundingBox(1));
+    xyBox(i,2) = ceil(statVol(i).BoundingBox(2));
+    xyBox(i,3) = ceil(statVol(i).BoundingBox(4));
+    xyBox(i,4) = ceil(statVol(i).BoundingBox(5));
+end
+
+for i = 1:numVol-1
+    curBox = xyBox(i,:);
+    curZen = volZse(i,2);
+    for j = 1:numVol-i
+        if j > 4
+            break;
+        end
+        nxtBox = xyBox(i+j,:);
+        nxtZst = volZse(i+j,1);
+        overlapRatio = bboxOverlapRatio(curBox, nxtBox);
+        gapLen = nxtZst - curZen - 1;
+        if (overlapRatio >= 0.1) && (gapLen >= 1) && (gapLen <= 5)
+            curBoxV = [curBox(1:2), curBox(1:2) + curBox(3:4)];
+            nxtBoxV = [nxtBox(1:2), nxtBox(1:2) + nxtBox(3:4)];
+            boxVstk = [curBoxV;nxtBoxV];
+            boxVmax = [max(boxVstk(:,1:2)), min(boxVstk(:,3:4))];
+            rs = boxVmax(2);re = boxVmax(4);cs = boxVmax(1);ce = boxVmax(3);
+            gapSt = single(mskPrdTh0(rs:re, cs:ce, curZen));
+            gapEn = single(mskPrdTh0(rs:re, cs:ce, nxtZst));
+            gapFl = uint8((gapSt + gapEn)/2 > 0.6);
+            for k = 1:gapLen
+                mskPrdCopy(rs:re, cs:ce, curZen+k) = gapFl;
+            end
+  
+            break;
+        end
+    end
+end
+
+
+% interpolation finish
+mskPrdTh = mskPrdTh0;
+
+% testing patients mets simple properties, prediction
+metPropsPrd = struct([]);
+for i = 1:186
+    prdMask = mskPrdTh(:,:,sliceIdx{i});
+    ccP = bwconncomp(prdMask);
+    numObjP = ccP.NumObjects;
+    statP = regionprops(ccP, 'BoundingBox');
+
+    pixelIdxP = cell(numObjP, 1);    % store the pixel index for comparison
+    metSzeP = zeros(numObjP, 1);
+
+    for j = 1:numObjP
+        pixelIdxP{j} = ccP.PixelIdxList{j};
+        xsize = statP(j).BoundingBox(4) * 0.9375;
+        ysize = statP(j).BoundingBox(5) * 0.9375;
+        metSzeP(j) = max([xsize, ysize]);
+    end
+    
+    metProp.pixIdx = pixelIdxP;
+    metProp.metSze = metSzeP;
+    metPropsPrd = cat(1, metPropsPrd, metProp);
+end
+
+% calculate the global dice
+overlap = mskTst.*mskPrdTh;
+union = sum(mskTst(:)) + sum(mskPrdTh(:));
+globalDice = 2*sum(overlap(:))/union;
+disp(['global Dice:' num2str(globalDice) newline])
+
+
+% calculate the Dices
+patientDice = zeros(186, 1);
+metCropDice = cell(186, 1);
+
+patientDiceA6 = zeros(186, 1);
+metCropDiceA6 = cell(186, 1);
+
+mslcPtNumMtSize = [];
+gapPtNumMtSize = [];
+for i = 1:186
+    prdMask = mskPrdTh(:,:,sliceIdx{i});
+    grdMask = patientDataTest(i).masks;
+    grdMask = uint8(grdMask > 0);
+        
+    % calculate the per-patient Dice
+    overlap = grdMask.*prdMask;
+    union = sum(grdMask(:)) + sum(prdMask(:));
+    patientDice(i) = 2*sum(overlap(:))/union;
+    
+    % get the ground truth crop range
+    metSizes = metPropsGrd(i).metSze;
+    metZCtrd = metPropsGrd(i).metZCd;
+    metCrops = metPropsGrd(i).metCrp;
+    numMets = length(metSizes);
+    cropDice = zeros(numMets, 1);
+    for j = 1:numMets
+        cV = metCrops(j,:);
+        grdMaskCrop = grdMask(cV(1):cV(2), cV(3):cV(4), cV(5):cV(6));
+        prdMaskCrop = prdMask(cV(1):cV(2), cV(3):cV(4), cV(5):cV(6));
+        
+        % tell whether a met crop has missing slics or gaps
+        slcMax = max(max(prdMaskCrop));
+        if min(slcMax) == 0 && max(slcMax) == 1
+            numSze = [i, metSizes(j)];
+            mslcPtNumMtSize = cat(1, mslcPtNumMtSize, numSze);
+        end
+            
+        sF1 = find(slcMax == 1, 1, 'first');
+        sL1 = find(slcMax == 1, 1, 'last');
+        sBtw = slcMax(sF1:sL1);
+        if min(sBtw) == 0
+            numSzePos = [i, metSizes(j), metZCtrd(j)];
+            gapPtNumMtSize = cat(1, gapPtNumMtSize, numSzePos);
+        end
+        
+        % calculate crop Dice
+        cropOV = grdMaskCrop.*prdMaskCrop;
+        cropUN = sum(grdMaskCrop(:)) + sum(prdMaskCrop(:));
+        cropDice(j) = 2*sum(cropOV(:))/cropUN; 
+    end
+    metCropDice{i} = cropDice;
+    metCropDiceA6{i} = cropDice(metSizes >= 6);
+    
+    % remove <6 objects for the ground truth mask
+    grdMaskA6 = grdMask;
+    ptmtA = metPropsGrd(i);
+    pixelIdxA = ptmtA.pixIdx;
+    metSizeA = ptmtA.metSze;
+    for k = 1:length(metSizeA)
+        if metSizeA(k) < 6
+            grdMaskA6(pixelIdxA{k}) = 0;
+        end
+    end
+    
+    % remove <6 objects for the prediction mask
+    prdMaskA6 = prdMask;
+    ptmtB = metPropsPrd(i);
+    pixelIdxB = ptmtB.pixIdx;
+    metSizeB = ptmtB.metSze;
+    for k = 1:length(metSizeB)
+        if metSizeB(k) < 6
+            prdMaskA6(pixelIdxB{k}) = 0;
+        end
+    end
+    
+    % calculate the per-patient Dice for mets >= 6 mm only
+    overlap = grdMaskA6.*prdMaskA6;
+    union = sum(grdMaskA6(:)) + sum(prdMaskA6(:));
+    patientDiceA6(i) = 2*sum(overlap(:))/union;
+end
+
+% display the numbers
+cDices = cat(1, metCropDice{:});
+cDicesTP = cDices(cDices > 0);
+
+cDicesA6 = cat(1, metCropDiceA6{:});
+cDicesA6TP = cDicesA6(cDicesA6 > 0);
+
+disp(newline)
+disp(['# of mets have gaps: ' num2str(size(gapPtNumMtSize, 1))])
+disp(['patient mean Dice: ' num2str(mean(patientDice))])
+disp(['all met crops mean Dice: ' num2str(mean(cDices))])
+disp(['TP met crops mean Dice: ' num2str(mean(cDicesTP))])
+
+ptA6sNum = 186 - sum(isnan(patientDiceA6));
+disp(['patient mean Dice (>=6): ' num2str(nanmean(patientDiceA6))])
+disp(['95% CI: ' num2str(nanmean(patientDiceA6)-1.96*nanstd(patientDiceA6)/sqrt(185))])
+disp(['95% CI: ' num2str(nanmean(patientDiceA6)+1.96*nanstd(patientDiceA6)/sqrt(185)) newline])
+
+disp(['all met crops mean Dice (>=6): ' num2str(mean(cDicesA6))])
+disp(['TP met crops mean Dice (>=6): ' num2str(mean(cDicesA6TP))])
+disp(['95% CI: ' num2str(mean(cDicesA6TP)-1.96*std(cDicesA6TP)/sqrt(410))])
+disp(['95% CI: ' num2str(mean(cDicesA6TP)+1.96*std(cDicesA6TP)/sqrt(410)) newline])
+
+
+
+
+
+%%% calculate the sensitivites/PPVs
+metsAll = {};   % all mets size, shape, signal and Dice, FPs
+allMetsSD = []; % all mets size and Dice only
+tpMetsSD = [];  % all tp mets size and Dice only
+fpMetsSize = []; % fp mets size
+patientSens = zeros(186,1); % patient wise sensitivity
+patientFPs = zeros(186, 1); % patient wise FPs
+patientPPV = zeros(186, 1); % patient PPV
+
+for i = 1:186
+    ptmtA = metPropsGrd(i);
+    pixelIdxA = ptmtA.pixIdx;
+    metSignal = ptmtA.pixSig;
+    metSizeA = ptmtA.metSze;
+    metShape = ptmtA.metShp;
+    metLoc = ptmtA.metLoc;
+
+    ptmtB = metPropsPrd(i);
+    pixelIdxB = ptmtB.pixIdx;
+    metSizeB = ptmtB.metSze;
+    
+    numMetA = length(pixelIdxA);
+    numMetB = length(pixelIdxB);
+    
+    gtDice = metCropDice{i};
+
+    % tell whether a prediction is true positive OR false positive
+    tpSize = zeros(numMetA, 1);
+    fpSize = zeros(numMetB, 1);
+    for j = 1:numMetB          
+        metIdxB = pixelIdxB{j};
+        fptag = 1;
+        for k = 1:numMetA
+            metIdxA = pixelIdxA{k};
+            cmnPxl = intersect(metIdxA, metIdxB);
+            if ~isempty(cmnPxl)
+                tpSize(k) = metSizeA(k);
+                fptag = 0;
+            end
+        end
+        
+        if fptag == 1
+            fpSize(j) = metSizeB(j);
+        end
+    end
+    
+    tpSize = tpSize(tpSize > 0);
+    fpSize = fpSize(fpSize > 0);
+    fnSize = setdiff(metSizeA, tpSize);
+
+    metPropDice = {metSizeA, metShape, metSignal, metLoc, gtDice, fpSize, tpSize, fnSize};
+    metsAll = cat(1, metsAll, metPropDice);
+    
+    allMetSizeDice = [metSizeA, gtDice];
+    allMetsSD = cat(1, allMetsSD, allMetSizeDice);
+    
+    tpMetSizeDice = [metSizeA(gtDice > 0), gtDice(gtDice > 0)];
+    tpMetsSD = cat(1, tpMetsSD, tpMetSizeDice);
+    
+    fpMetsSize = cat(1, fpMetsSize, fpSize);
+    
+    patientSens(i) = length(tpSize)/numMetA;
+    patientFPs(i)  = length(fpSize);
+    patientPPV(i)  = length(tpSize)/(length(tpSize) + length(fpSize));
+end
+tpMetsSDsorted = sortrows(tpMetsSD);
+tpMetsSDsorted(:,2) = tpMetsSDsorted(:,2)*100;
+tpMetsSizeAll = tpMetsSDsorted(:,1);
+tpMetsSizeA6 = tpMetsSizeAll(tpMetsSizeAll >= 6);
+fpMetsSizeA6 = fpMetsSize(fpMetsSize >= 6);
+
+% calculate the detection sensitivity and display
+disp(newline)
+disp(['mean patient sensitivity: ' num2str(mean(patientSens))])
+disp(['std: ' num2str(std(patientSens))])
+disp(['patient sens. 95% CI: ' num2str(mean(patientSens)-1.96*std(patientSens)/sqrt(186))])
+disp(['patient sens. 95% CI: ' num2str(mean(patientSens)+1.96*std(patientSens)/sqrt(186)) newline])
+
+disp(['mean patient FPs: ' num2str(mean(patientFPs))])
+disp(['std: ' num2str(std(patientFPs))])
+disp(['mean patient PPV: ' num2str(mean(patientPPV))])
+disp(['patient PPV. 95% CI: ' num2str(mean(patientPPV)-1.96*std(patientPPV)/sqrt(186))])
+disp(['patient PPV. 95% CI: ' num2str(mean(patientPPV)+1.96*std(patientPPV)/sqrt(186)) newline])
+
+disp(['mean patient Dice: ' num2str(mean(patientDice))])
+disp(['patient Dice 95% CI: ' num2str(mean(patientDice)-1.96*std(patientDice)/sqrt(186))])
+disp(['patient Dice 95% CI: ' num2str(mean(patientDice)+1.96*std(patientDice)/sqrt(186)) newline])
+
+disp(['median all met Dice: ' num2str(median(allMetsSD(:,2)))])
+disp(['mean all met Dice: ' num2str(mean(allMetsSD(:,2)))])
+disp(['median tp met Dice: ' num2str(median(tpMetsSD(:,2)))])
+disp(['mean tp met Dice: ' num2str(mean(tpMetsSD(:,2)))])
+disp(['tp met Dice 95% CI: ' num2str(mean(tpMetsSD(:,2))-1.96*std(tpMetsSD(:,2))/sqrt(648))])
+disp(['tp met Dice 95% CI: ' num2str(mean(tpMetsSD(:,2))+1.96*std(tpMetsSD(:,2))/sqrt(648))])
+
+
+
+
+%%%%%%%%%%%%%%%%%%%%% per-patient Sensitivity analysis %%%%%%%%%%%%%%%
+%%%%% other analysis: sensitivity and PPV below or above 3 mm
+sensBA3 = zeros(186,2);
+PPVBA3 = zeros(186,2);
+for i = 1:186
+    gtMetSize = metsAll{i,1};
+    gtMetDice = metsAll{i,5};
+    tpMetSize = gtMetSize(gtMetDice > 0);
+    fpMetSize = metsAll{i,6};
+    
+    gtB3 = sum(gtMetSize < 3);
+    gtA3 = sum(gtMetSize >= 3);
+    
+    tpB3 = sum(tpMetSize < 3);
+    tpA3 = sum(tpMetSize >= 3);
+    
+    fpB3 = sum(fpMetSize < 3);
+    fpA3 = sum(fpMetSize >= 3);
+    
+    sensBA3(i,1) = tpB3/gtB3;
+    sensBA3(i,2) = tpA3/gtA3;
+    
+    PPVBA3(i,1) = tpB3/(tpB3 + fpB3);
+    PPVBA3(i,2) = tpA3/(tpA3 + fpA3);
+end
+% display the numbers: sensitivity
+sNumB3 = 186 - sum(isnan(sensBA3(:,1)));
+sNumA3 = 186 - sum(isnan(sensBA3(:,2)));
+
+disp(newline)
+disp(['<3 mm sensitivity is: ', num2str(nanmean(sensBA3(:,1)))])
+disp(['std sensitivity is: ',  num2str(nanstd(sensBA3(:,1)))])
+disp(['95 CI: ', num2str(nanmean(sensBA3(:,1)) - 2.0*nanstd(sensBA3(:,1))/sqrt(sNumB3))])
+disp(['95 CI: ', num2str(nanmean(sensBA3(:,1)) + 2.0*nanstd(sensBA3(:,1))/sqrt(sNumB3))])
+
+disp(['>=3 mm sensitivity is: ', num2str(nanmean(sensBA3(:,2)))])
+disp(['std sensitivity is: ',  num2str(nanstd(sensBA3(:,2)))])
+disp(['95 CI: ', num2str(nanmean(sensBA3(:,2)) - 1.96*nanstd(sensBA3(:,2))/sqrt(sNumA3))])
+disp(['95 CI: ', num2str(nanmean(sensBA3(:,2)) + 1.96*nanstd(sensBA3(:,2))/sqrt(sNumA3))])
+
+[h, p] = ttest2(sensBA3(:,1), sensBA3(:,2));
+disp(['met size matters: ', num2str(h), ', p value: ', num2str(p), newline])
+
+% display the numbers: PPV
+sNumB3 = 186 - sum(isnan(PPVBA3(:,1)));
+sNumA3 = 186 - sum(isnan(PPVBA3(:,2)));
+
+disp(['<3 mm PPV is: ', num2str(nanmean(PPVBA3(:,1)))])
+disp(['std PPV is: ',  num2str(nanstd(PPVBA3(:,1)))])
+disp(['95 CI up is: ',  num2str(nanmean(PPVBA3(:,1)) + 1.99*nanstd(PPVBA3(:,1))/sqrt(sNumB3))])
+disp(['95 CI low is: ', num2str(nanmean(PPVBA3(:,1)) - 1.99*nanstd(PPVBA3(:,1))/sqrt(sNumB3))])
+
+disp(['>=3 mm PPV is: ', num2str(nanmean(PPVBA3(:,2)))])
+disp(['std PPV is: ',  num2str(nanstd(PPVBA3(:,2)))])
+disp(['95 CI up is: ',  num2str(nanmean(PPVBA3(:,2)) + 1.96*nanstd(PPVBA3(:,2))/sqrt(sNumA3))])
+disp(['95 CI low is: ', num2str(nanmean(PPVBA3(:,2)) - 1.96*nanstd(PPVBA3(:,2))/sqrt(sNumA3))])
+
+[h, p] = ttest2(PPVBA3(:,1), PPVBA3(:,2));
+disp(['met size matters: ', num2str(h), ', p value: ', num2str(p), newline])
+
+
+%%%%% other analysis: sensitivity and PPV below or above 6 mm
+sensBA6 = zeros(186,2);
+FPsBA6 = zeros(186,2);
+PPVBA6 = zeros(186,2);
+
+for i = 1:186
+    gtMetSize = metsAll{i,1};
+    gtMetDice = metsAll{i,5};
+    tpMetSize = gtMetSize(gtMetDice > 0);
+    fpMetSize = metsAll{i,6};
+    
+    gtB6 = sum(gtMetSize < 6);
+    gtA6 = sum(gtMetSize >= 6);
+    
+    tpB6 = sum(tpMetSize < 6);
+    tpA6 = sum(tpMetSize >= 6);
+    
+    fpB6 = sum(fpMetSize < 6);
+    fpA6 = sum(fpMetSize >= 6);
+    
+    sensBA6(i,1) = tpB6/gtB6;
+    sensBA6(i,2) = tpA6/gtA6;
+    
+    FPsBA6(i,1) = fpB6;
+    FPsBA6(i,2) = fpA6;
+    
+    PPVBA6(i,1) = tpB6/(tpB6 + fpB6);
+    PPVBA6(i,2) = tpA6/(tpA6 + fpA6);
+end
+% display the numbers: sensitivity
+sNumB6 = 186 - sum(isnan(sensBA6(:,1)));
+sNumA6 = 186 - sum(isnan(sensBA6(:,2)));
+
+disp(['<6 mm sensitivity is: ', num2str(nanmean(sensBA6(:,1)))])
+disp(['std: ',   num2str(nanstd(sensBA6(:,1)))])
+disp(['95 CI: ', num2str(nanmean(sensBA6(:,1)) - 1.98*nanstd(sensBA6(:,1))/sqrt(sNumB6))])
+disp(['95 CI: ', num2str(nanmean(sensBA6(:,1)) + 1.98*nanstd(sensBA6(:,1))/sqrt(sNumB6))])
+
+disp(['>=6 mm sensitivity is: ', num2str(nanmean(sensBA6(:,2)))])
+disp(['std: ',   num2str(nanstd(sensBA6(:,2)))])
+disp(['95 CI: ', num2str(nanmean(sensBA6(:,2)) - 1.96*nanstd(sensBA6(:,2))/sqrt(sNumA6))])
+disp(['95 CI: ', num2str(nanmean(sensBA6(:,2)) + 1.96*nanstd(sensBA6(:,2))/sqrt(sNumA6))])
+
+[h, p] = ttest2(sensBA6(:,1), sensBA6(:,2));
+disp(['met size matters: ', num2str(h), ', p value: ', num2str(p), newline])
+
+% display the numbers: FPs
+disp(['<6 mm FPs is: ', num2str(mean(FPsBA6(:,1)))])
+disp(['std: ',   num2str(std(FPsBA6(:,1)))])
+disp(['95 CI: ', num2str(mean(FPsBA6(:,1)) - 1.96*std(FPsBA6(:,1))/sqrt(186))])
+disp(['95 CI: ', num2str(mean(FPsBA6(:,1)) + 1.96*std(FPsBA6(:,1))/sqrt(186))])
+
+disp(['>=6 mm FPs is: ', num2str(mean(FPsBA6(:,2)))])
+disp(['std: ',   num2str(std(FPsBA6(:,2)))])
+disp(['95 CI: ', num2str(mean(FPsBA6(:,2)) - 1.96*std(FPsBA6(:,2))/sqrt(186))])
+disp(['95 CI: ', num2str(mean(FPsBA6(:,2)) + 1.96*std(FPsBA6(:,2))/sqrt(186))])
+
+% display the numbers: PPV
+sNumB6 = 186 - sum(isnan(PPVBA6(:,1)));
+sNumA6 = 186 - sum(isnan(PPVBA6(:,2)));
+
+disp(['<6 mm PPV is: ', num2str(nanmean(PPVBA6(:,1)))])
+disp(['std PPV is: ',  num2str(nanstd(PPVBA6(:,1)))])
+disp(['95 CI: ', num2str(nanmean(PPVBA6(:,1)) - 1.96*nanstd(PPVBA6(:,1))/sqrt(sNumB6))])
+disp(['95 CI: ', num2str(nanmean(PPVBA6(:,1)) + 1.96*nanstd(PPVBA6(:,1))/sqrt(sNumB6))])
+
+disp(['>=6 mm PPV is: ', num2str(nanmean(PPVBA6(:,2)))])
+disp(['std PPV is: ',  num2str(nanstd(PPVBA6(:,2)))])
+disp(['95 CI: ', num2str(nanmean(PPVBA6(:,2)) - 1.96*nanstd(PPVBA6(:,2))/sqrt(sNumA6))])
+disp(['95 CI: ', num2str(nanmean(PPVBA6(:,2)) + 1.96*nanstd(PPVBA6(:,2))/sqrt(sNumA6))])
+
+[h, p] = ttest2(PPVBA6(:,1), PPVBA6(:,2));
+disp(['met size matters: ', num2str(h), ', p value: ', num2str(p), newline])
+
+
+%%%%% other analysis: sensitivity about the shape
+sensShape = zeros(186,2);
+for i = 1:186
+    gtMetShape = metsAll{i,2};
+    gtMetDice  = metsAll{i,5};
+    tpMetShape = gtMetShape(gtMetDice > 0);
+    
+    gtRound = sum((gtMetShape >= 0.9) & (gtMetShape <= 1.1));
+    gtOval  = sum((gtMetShape < 0.9) | (gtMetShape > 1.1));
+    
+    tpRound = sum((tpMetShape >= 0.9) & (tpMetShape <= 1.1));
+    tpOval  = sum((tpMetShape < 0.9) | (tpMetShape > 1.1));
+    
+    sensShape(i,1) = tpRound/gtRound;
+    sensShape(i,2) = tpOval/gtOval;
+end
+% display the numbers: sensitivity
+sNumOval = 186 - sum(isnan(sensShape(:,1)));
+sNumRound = 186 - sum(isnan(sensShape(:,2)));
+
+disp(newline)
+disp(['Round sensitivity is: ', num2str(nanmean(sensShape(:,1)))])
+disp(['std sensitivity is: ',  num2str(nanstd(sensShape(:,1)))])
+disp(['95 CI: ', num2str(nanmean(sensShape(:,1)) - 1.96*nanstd(sensShape(:,1))/sqrt(sNumOval))])
+disp(['95 CI: ', num2str(nanmean(sensShape(:,1)) + 1.96*nanstd(sensShape(:,1))/sqrt(sNumOval))])
+
+disp(['Oval sensitivity is: ', num2str(nanmean(sensShape(:,2)))])
+disp(['std sensitivity is: ',  num2str(nanstd(sensShape(:,2)))])
+disp(['95 CI: ', num2str(nanmean(sensShape(:,2)) - 1.96*nanstd(sensShape(:,2))/sqrt(sNumRound))])
+disp(['95 CI: ', num2str(nanmean(sensShape(:,2)) + 1.96*nanstd(sensShape(:,2))/sqrt(sNumRound))])
+
+[h, p] = ttest2(sensShape(:,1), sensShape(:,2));
+disp(['met shape matters: ', num2str(h), ', p value: ', num2str(p), newline])
+
+
+
+%%%%% other analysis: sensitivity about the necrosis
+sensSig = zeros(186,2);
+for i = 1:186
+    gtMetSignal = metsAll{i,3};
+    gtMetStd = zeros(length(gtMetSignal),1);
+    for j = 1:length(gtMetSignal)
+        gtMetStd(j) = std(single(gtMetSignal{j}));
+    end
+    gtMetDice = metsAll{i,5};
+    tpMetStd = gtMetStd(gtMetDice > 0);
+    
+    gtHem = sum(gtMetStd <= 200);
+    gtNec = sum(gtMetStd > 200);
+    
+    tpHem = sum(tpMetStd <= 200);
+    tpNec = sum(tpMetStd > 200);
+    
+    sensSig(i,1) = tpHem/gtHem;
+    sensSig(i,2) = tpNec/gtNec;
+end
+% display the numbers: sensitivity
+sNumHem = 186 - sum(isnan(sensSig(:,1)));
+sNumNec = 186 - sum(isnan(sensSig(:,2)));
+
+disp(newline)
+disp(['Hemorrhagic sensitivity is: ', num2str(nanmean(sensSig(:,1)))])
+disp(['std sensitivity is: ',  num2str(nanstd(sensSig(:,1)))])
+disp(['95 CI up is: ',  num2str(nanmean(sensSig(:,1)) + 1.96*nanstd(sensSig(:,1))/sqrt(sNumHem))])
+disp(['95 CI low is: ', num2str(nanmean(sensSig(:,1)) - 1.96*nanstd(sensSig(:,1))/sqrt(sNumHem))])
+
+disp(['Necrotic sensitivity is: ', num2str(nanmean(sensSig(:,2)))])
+disp(['std sensitivity is: ',  num2str(nanstd(sensSig(:,2)))])
+disp(['95 CI up is: ',  num2str(nanmean(sensSig(:,2)) + 1.98*nanstd(sensSig(:,2))/sqrt(sNumNec))])
+disp(['95 CI low is: ', num2str(nanmean(sensSig(:,2)) - 1.98*nanstd(sensSig(:,2))/sqrt(sNumNec))])
+
+[h, p] = ttest2(sensSig(:,1), sensSig(:,2));
+disp(['hemo/necro matters: ', num2str(h), ', p value: ', num2str(p), newline])
+
+
+%%%%% other analysis: sensitivity about the location
+sensLoc = zeros(186,2);
+for i = 1:186
+    gtMetLoc = metsAll{i,4};
+    gtMetDice = metsAll{i,5};
+    tpMetLoc = gtMetLoc(gtMetDice > 0);
+    
+    gtUp = sum(gtMetLoc == 1);
+    gtDn = sum(gtMetLoc == 2);
+    
+    tpUp = sum(tpMetLoc == 1);
+    tpDn = sum(tpMetLoc == 2);
+    
+    sensLoc(i,1) = tpUp/gtUp;
+    sensLoc(i,2) = tpDn/gtDn;
+end
+% display the numbers: sensitivity
+sNumUp = 186 - sum(isnan(sensLoc(:,1)));
+sNumDn = 186 - sum(isnan(sensLoc(:,2)));
+
+disp(newline)
+disp(['upper brain sensitivity is: ', num2str(nanmean(sensLoc(:,1)))])
+disp(['std sensitivity is: ',  num2str(nanstd(sensLoc(:,1)))])
+disp(['95 CI up is: ',  num2str(nanmean(sensLoc(:,1)) + 1.96*nanstd(sensLoc(:,1))/sqrt(sNumUp))])
+disp(['95 CI low is: ', num2str(nanmean(sensLoc(:,1)) - 1.96*nanstd(sensLoc(:,1))/sqrt(sNumUp))])
+
+disp(['lower brain sensitivity is: ', num2str(nanmean(sensLoc(:,2)))])
+disp(['std sensitivity is: ',  num2str(nanstd(sensLoc(:,2)))])
+disp(['95 CI up is: ',  num2str(nanmean(sensLoc(:,2)) + 1.99*nanstd(sensLoc(:,2))/sqrt(sNumDn))])
+disp(['95 CI low is: ', num2str(nanmean(sensLoc(:,2)) - 1.99*nanstd(sensLoc(:,2))/sqrt(sNumDn))])
+
+[h, p] = ttest2(sensLoc(:,1), sensLoc(:,2));
+disp(['cerebrum/cerebellum matters: ', num2str(h), ', p value: ', num2str(p), newline])
+
+
+
+%%%%%%%%%%%%%%%%%%%%% pet-met Dice analysis %%%%%%%%%%%%%%%
+%%%%% other analysis: per-met Dice below or above 6 mm
+diceSize = {};
+for i = 1:186
+    gtMetSize = metsAll{i,1};
+    gtMetDice = metsAll{i,5};
+    
+    tpMetSize = gtMetSize(gtMetDice > 0);
+    tpMetDice = gtMetDice(gtMetDice > 0);
+    
+    tpMetSzDc = [tpMetSize, tpMetDice];
+    diceSize = cat(1, diceSize, tpMetSzDc);
+end
+diceSize = cat(1, diceSize{:});
+sizeList = diceSize(:,1);
+diceList = diceSize(:,2);
+diceB6 = diceList(sizeList < 6);
+diceA6 = diceList(sizeList >= 6);
+% display the numbers: shape-dice
+sNumB6 = length(diceB6);
+sNumA6 = length(diceA6);
+disp(newline)
+disp(['below 6 Dice is: ', num2str(mean(diceB6))])
+disp(['std Dice is: ',  num2str(std(diceB6))])
+disp(['95 CI up is: ',  num2str(mean(diceB6) + 1.96*std(diceB6)/sqrt(sNumB6))])
+disp(['95 CI low is: ', num2str(mean(diceB6) - 1.96*std(diceB6)/sqrt(sNumB6))])
+
+disp(['over 6 Dice is: ', num2str(mean(diceA6))])
+disp(['std Dice is: ',  num2str(std(diceA6))])
+disp(['95 CI up is: ',  num2str(mean(diceA6) + 1.96*std(diceA6)/sqrt(sNumA6))])
+disp(['95 CI low is: ', num2str(mean(diceA6) - 1.96*std(diceA6)/sqrt(sNumA6))])
+
+[h, p] = ttest2(diceB6, diceA6);
+disp(['met size matters Dice: ', num2str(h), ', p value: ', num2str(p), newline])
+
+
+%%%%% other analysis: per-met Dice about the shape
+diceShape = {};
+for i = 1:186
+    gtMetShape = metsAll{i,2};
+    gtMetDice  = metsAll{i,5};
+    
+    tpMetShape = gtMetShape(gtMetDice > 0);
+    tpMetDice  = gtMetDice(gtMetDice > 0);
+    
+    tpMetShDc = [tpMetShape, tpMetDice];
+    diceShape = cat(1, diceShape, tpMetShDc);
+end
+diceShape = cat(1, diceShape{:});
+shapeList = diceShape(:,1);
+diceList = diceShape(:,2);
+diceOval  = diceList(shapeList < 0.9 | shapeList > 1.1);
+diceRound = diceList(shapeList >= 0.9 & shapeList <= 1.1);
+% display the numbers: shape-dice
+sNumOval = length(diceOval);
+sNumRound = length(diceRound);
+disp(newline)
+disp(['Round Dice is: ', num2str(mean(diceRound))])
+disp(['std Dice is: ',  num2str(std(diceRound))])
+disp(['95 CI up is: ',  num2str(mean(diceRound) + 1.96*std(diceRound)/sqrt(sNumRound))])
+disp(['95 CI low is: ', num2str(mean(diceRound) - 1.96*std(diceRound)/sqrt(sNumRound))])
+
+disp(['Oval Dice is: ', num2str(mean(diceOval))])
+disp(['std Dice is: ',  num2str(std(diceOval))])
+disp(['95 CI up is: ',  num2str(mean(diceOval) + 1.96*std(diceOval)/sqrt(sNumOval))])
+disp(['95 CI low is: ', num2str(mean(diceOval) - 1.96*std(diceOval)/sqrt(sNumOval))])
+
+[h, p] = ttest2(diceRound, diceOval);
+disp(['met shape matters: ', num2str(h), ', p value: ', num2str(p), newline])
+
+
+%%%%% other analysis: per-met Dice about the signal
+diceSig = {};
+for i = 1:186
+    gtMetSignal = metsAll{i,3};
+    gtMetStd = zeros(length(gtMetSignal),1);
+    for j = 1:length(gtMetSignal)
+        gtMetStd(j) = std(single(gtMetSignal{j}));
+    end
+    gtMetDice  = metsAll{i,5};
+    
+    tpMetStd = gtMetStd(gtMetDice > 0);
+    tpMetDice = gtMetDice(gtMetDice > 0);
+    
+    tpMetSigDc = [tpMetStd, tpMetDice];
+    diceSig = cat(1, diceSig, tpMetSigDc);
+end
+diceSig = cat(1, diceSig{:});
+sigList = diceSig(:,1);
+diceList = diceSig(:,2);
+diceHem = diceList(sigList <= 200);
+diceNec = diceList(sigList > 200);
+% display the numbers: shape-dice
+sNumHem = length(diceHem);
+sNumNec = length(diceNec);
+disp(newline)
+disp(['Hem Dice is: ', num2str(mean(diceHem))])
+disp(['std Dice is: ',  num2str(std(diceHem))])
+disp(['95 CI up is: ',  num2str(mean(diceHem) + 1.96*std(diceHem)/sqrt(sNumHem))])
+disp(['95 CI low is: ', num2str(mean(diceHem) - 1.96*std(diceHem)/sqrt(sNumHem))])
+
+disp(['Nec Dice is: ', num2str(mean(diceNec))])
+disp(['std Dice is: ',  num2str(std(diceNec))])
+disp(['95 CI up is: ',  num2str(mean(diceNec) + 1.96*std(diceNec)/sqrt(sNumNec))])
+disp(['95 CI low is: ', num2str(mean(diceNec) - 1.96*std(diceNec)/sqrt(sNumNec))])
+
+[h, p] = ttest2(diceHem, diceNec);
+disp(['met signal matters: ', num2str(h), ', p value: ', num2str(p), newline])
+
+
+%%%%% other analysis: per-met Dice about the location
+diceLoc = {};
+for i = 1:186
+    gtMetLoc = metsAll{i,4};
+    gtMetDice  = metsAll{i,5};
+    
+    tpMetLoc = gtMetLoc(gtMetDice > 0);
+    tpMetDice  = gtMetDice(gtMetDice > 0);
+    
+    tpMetLcDc = [tpMetLoc, tpMetDice];
+    diceLoc = cat(1, diceLoc, tpMetLcDc);
+end
+diceLoc = cat(1, diceLoc{:});
+locList = diceLoc(:,1);
+diceList = diceLoc(:,2);
+diceUp = diceList(locList == 1);
+diceDn = diceList(locList == 2);
+% display the numbers: shape-dice
+sNumUp = length(diceUp);
+sNumDn = length(diceDn);
+disp(newline)
+disp(['Up Dice is: ', num2str(mean(diceUp))])
+disp(['std Dice is: ',  num2str(std(diceUp))])
+disp(['95 CI up is: ',  num2str(mean(diceUp) + 1.96*std(diceUp)/sqrt(sNumUp))])
+disp(['95 CI low is: ', num2str(mean(diceUp) - 1.96*std(diceUp)/sqrt(sNumUp))])
+
+disp(['Dn Dice is: ', num2str(mean(diceDn))])
+disp(['std Dice is: ',  num2str(std(diceDn))])
+disp(['95 CI up is: ',  num2str(mean(diceDn) + 1.98*std(diceDn)/sqrt(sNumDn))])
+disp(['95 CI low is: ', num2str(mean(diceDn) - 1.98*std(diceDn)/sqrt(sNumDn))])
+
+[h, p] = ttest2(diceUp, diceDn);
+disp(['met loc matters: ', num2str(h), ', p value: ', num2str(p), newline])
+
